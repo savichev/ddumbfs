@@ -1,0 +1,416 @@
+.. ddumbfs refcounter
+
+reference counter pro and con
+=============================
+
+Often, deduplication systems use a reference counter (*refcounter*).
+I'm trying to demonstrate that we can do without such a *counter* 
+and get some advantages.
+
+ddumbfs data structure
+-----------------------
+A quick reminder about the structure of the data used in ddumbfs:
+
+- The blocks of fixed size are stored one after the other in the **BlockFile**.
+- A **bitarray** to know which blocks are free or not.
+- An **Index** that do the map between a hash and the address of the block in the *BlockFile*.
+- The **underlying filesystem** store the directory tree and file attributes. ddumbfs simply use a local directory to store the filesystem metadata.
+- The **Files** inside the *Underlying filesystem* store the content of the files as a list of references to the blocks. A references is a tuple (blockaddresse, hash). The address allows a quick access to the data without accessing the Index and the hash allows to check the integrity of the data and quickly rebuild, repair or check the *Index* integrity. 
+
+Keep in mind that most of the maintenance operations (check, repair, rebuild, reclaim) of these structures are done using sequential accesses and then are fast. Only the bitarray is accessed randomly during maintenance.
+
+The reclaim procedure
+---------------------- 
+As you can see ddumbfs doesn’t have any reference counter. 
+When a reference is deleted, ddumbfs don't know if the referenced block can be freed or not.
+Instead, ddumbfs uses a **reclaim** procedure to free blocks. 
+This procedure reads all references in Files (this can be a huge amount of data) 
+and marks used blocks in an auxiliary bitarray. When done, 
+the Index is read and any references to a block that don't exist (any more) is removed. 
+Finally the auxiliary *bitarray* replace the one in use. 
+This procedure is similar to a recount of the references except we are not using counters, 
+just a single bit per block.
+The reclaim procedure can be run while the system is online by simply marking 
+any new allocation into the both bitarray (the current one and the auxiliary one). 
+This procedure is heavy and is not run after any deletion but at the user request 
+or when the system is low in space.
+
+The obvious pro and con are
+----------------------------
+
+- no need to increment the counter for every new reference, this avoid an update ( a write() )
+- no need do decrement the counter for any delete,  this avoid an update ( a write() )
+- often multiples blocks are deleted at once and this is instantaneous in ddumbfs. With a refcounter, this take minutes to do all the updates and this is similar to a online reclaim procedure.
+- this is faster during the everyday use of the system (when no reclaim() is required).
+- The reclaim() can be run at night (when the load is low), this is a way to level the use of the system between the different period of the day.
+- The reclaim() procedure include trivial checks and can detect, report and correct some kind of corruptions.
+
+Speculative pro and con:
+
+- a *refcounter* could be incorrect and a block be freed too early or stay forever.
+- when corruption is detected, a system with a refcounter need a **recount** procedure that is more expensive than a reclaim 
+
+A word about transactions
+-------------------------
+
+The system can be interrupted at any time by a crash. 
+At restart the system must be able to check and fix any corruption. 
+This is why transactions are useful, among other things. 
+Transactions maintains multiple versions of the objects, 
+the old one and the current one that is modified by ongoing operations. 
+Keeping a transaction open slow down the process 
+(often copy on write and maintaining the index(es) for fast access to the temporary objects) 
+and at commit or roll-back time the system has to *chose* one of these two versions. 
+
+ddumbfs is **transaction less** and use a kind **checkpoints** system instead.
+This is possible because *object* inside the *Index* never change. The only
+thing that change is the *arrival* of new object and the *removal* of old one.
+And all this information (absence or presence) is kept by a tiny structure: 
+the *bitarray*, that can be saved is a very small amount of time to create a checkpoint.
+
+Every Nth operations or at user request, 
+the system make a dump of the *bitarray* and maintains a list of all Files 
+that have been modified. 
+At restart time, ddumbfs read references from the Index and modified Files. 
+Any new references in the Index (regarding the saved *bitarray*) are checked and 
+discarded if they cannot be resolved. 
+The Index is cleaned up and errors will never propagate. 
+If a references in a *File* cannot be resolved, 
+the problem is reported into the log file and the administrator can decide 
+what to do (delete the file, truncate the file just fefore the error, 
+returning a read error when accessing this block or replacing the faulty block by zeroes).
+This is the dumb aspect of ddumbfs. 
+Their is a chance for a reference to be resolved later when new data are coming, this is a kind of self healing. 
+But this inconvenient is not related to the use or not of a *refcounter*, only to the way ddumbfs handle file content.
+A system with a *refcounter* could also choose to keep the handling of the files 
+out of the transaction and suffer of the same inconveniences.
+
+The main question is: How do the reclaim counterbalance the saving of the refcounter?
+-------------------------------------------------------------------------------------- 
+
+To answer this question, I'll make some theoretical calculation 
+on two imaginary systems with (*COUNTER*) and without *refcounter* (*NOCOUNT*), 
+regarding only the access to the Index 
+(for the reclaim procedure I also need to take into account access to the *Files*).
+
+
+Even if the *Index* in ddumbfs is "small", and ddumbfs *mmap()* and 
+try to *lock* it into memory, I suppose that the Index is stored on disk 
+and require IOPs for read and write. This stay a bit true even when mapped and locked
+into memory because any change must be written to disk. The disk cache system can
+reorder the write operations to optimize them a bit but because of the nature 
+of the cryptographic hash, access stay mostly random and at sync() time everything 
+must be on disk.
+ 
+I suppose that the Index of both system use an ideal hash table and that object 
+are always found/updated in one single random *read* or *write* operation.
+
+I suppose that I have a backup system that is stable in size, new data compensate data that are deleted. 
+I compare the "operations" on one "cycle". On a *NOCOUNT* system, cycles are circumscribed by 2 *reclaim* and *reclaim* are run when free space become low.
+In others words, while the new backups fill in the space, simultaneously the delete of old backups free the same amount of space.
+On a NOCOUNT system, we are waiting to reach a threshold size before to run a *reclaim*. The *reclaim* end the cycle. 
+On the COUNTER system I imagine the same backups and deletes operations but without any *reclaim*.
+
+
+Here are the graphs, I explain the calculations below within the gnuplot script.  
+
+.. image:: /_static/refcount_dedupratio.png
+
+The most important in these graph is that their is no exponential line, making
+both system good competitor (I ignore the extra cost required by a transactional system)    
+
+The first one shows that the extra operations for a NOCOUNT system in green
+requires a lot less of operations than the extra operations for a COUNTER system
+in red. The purple line (scale on the right) show that the ratio between these two values
+decrease and stabilize when dedup ratio is increasing.  
+
+Both must be added to the COMMON part in blue. 
+When including the COMMON part, the total ratio drop between 3 and 4 (the aqua line). 
+( the COUNTER system require a least 3 time more operations than the NOCOUNT one)   
+
+For example for a dedup ratio of 6, the number of operations are::
+
+        DEDUP_RATIO=6.0 
+        COMMON=0.70 
+        COUNTER=1.70 
+        NOCOUNT=0.04 
+        RATIO=38.78
+        TOTAL_RATIO=3.23
+        
+
+The second graph make the THRESHOLD capacity vary.
+
+The purple line show that more you increase the interval between each reclaim,
+more you win.   
+
+.. image:: /_static/refcount_threshold.png
+
+
+How long takes the reclaim procedure
+-------------------------------------
+
+The formulas are in the gnuplot script.
+
+The reclaim procedure read all the references from the *Files* 
+and mark used block in an auxiliary *bitarray*, 
+then the Index is read sequentially and any reference
+having an address that is not in the *bitarray* is removed.
+I'm assuming that the *Index* is fully rewritten even if
+only some entries are modified. All accesses are sequential.
+
+Here are two graph, be careful the scale are both logarithmic on both side,
+the X axes is the saze of the storage (without dedup) and dedup ratio is 6.0
+
+Keep in mind that this is made online.
+  
+In the first graph, I imagine a configuration for a  Corporate business 
+with a storage up to 1PB and a RAID10 4*150M/s system with a throughput of 600MB/s 
+for reading and 300MB/s for writing. Less than 2H for a 1PB system
+
+.. image:: /_static/reclaim_corporate.png
+
+The second graph show a Small business with simple SATA disks at 100MB/s.
+Less than 2min and 30sec for a 4TB system.  
+
+.. image:: /_static/reclaim_soho.png
+  
+Both graph show that the reclaim time is reasonable regarding the capacity.
+The green line show that the read of the reference is a big part of the time.
+This time can be reduced by a 4 factor by splitting apart the addresses and the 
+hashes.
+
+
+More pro for the ddumbfs system
+---------------------------------
+
+You already know that the reclaim can be done online.
+Because of the simplistic data structure in use in ddumbfs
+I can imagine to make the recovery online too.
+
+During the recovery, any read would require a check of the hash of the block
+and return an *error* if the hash don't match. 
+It is possible for the missing reference to be resolved later 
+by the recovery process and then the user should retry after the end of the recovery.
+
+Any write into the *Index* is always safe, then don't worry. 
+Blocks should be written in some *safe* place to be sure to not overwrite any
+data that are not yet referenced by the faulty *Index*. Block full of zeroes
+are safe and the reclaim procedure could zeroes some block and keep a list
+of them to speed up the process.
+
+One current drawback that could be fixed is that the size of the ddumbfs 
+structures are fixed at creation time. An offline resize procedure exists.
+This resize procedure could be done online without too much work.
+
+All of this could make ddumbfs a highly available filesystem.
+
+
+
+The gnuplot script
+-------------------
+
+Here are all the detail of the calculations above in a gnuplot script::
+
+        #
+        # run this script with gnuplot
+        #
+         
+        # I suppose a storage capacity of N blocks ( 16E6 * 64KB ~ 1TB ) 
+        N=16E6
+        
+        # The size of a block 
+        BLOCK_SIZE=64*1024
+        
+        # the size of a TIGER192 hash is 24 bytes
+        HASH_SIZE=24
+        
+        # the size of an address is optimized for the size of the filesystem
+        # 32bits allow to addresss up to 256TB
+        ADDR_SIZE=4
+        
+        # A reference to a block is a (HASH, ADDR)
+        REF_SIZE=HASH_SIZE + ADDR_SIZE
+        
+        # A page SIZE, 
+        PAGE_SIZE=4096
+        
+        # the size of the ddumbfs index is 
+        DD_INDEX_SIZE=N * 1.3 * (HASH_SIZE + REF_SIZE)
+        
+        # I suppose a dedup ratio of ( can be changed at any time)
+        DEDUP_RATIO=6.0
+        
+        # I suppose that the used capacity is stabilized at 
+        BASE_CAPACITY_IN_PERCENT=0.75
+        
+        # Before to reclaim the free space, the used space can grow up to
+        THRESHOLD_CAPACITY_IN_PERCENT=0.85
+        
+        # To reach the threshold capacity and because of the DEDUP_RATIO 
+        # I need to backup an amount of data equal to:
+        AMOUNT_IN_PERCENT=(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*DEDUP_RATIO
+        AMOUNT_IN_BLOCKS=AMOUNT_IN_PERCENT*N
+        
+        # one part of these blocks are new and must be added to the dedupengine 
+        VARIABLE_PART=1.0/DEDUP_RATIO
+        # the remaining part is already in the dedupengine 
+        # and we just need to increment the refcounter (for the COUNTER)
+        PERSISTENT_PART=1.0-VARIABLE_PART
+        
+        #  I will dispatch the count of the operations into 3 objects
+        # COMMON: when the same operation is required by both systems
+        # COUNTER and NOCOUNT: that will count operations specific to both systems
+        # and operations can be sequentail (seq) or random (rnd)
+        # and can be read (rd) or write (wr)
+        
+        # Now I'm counting the operation, summing new one to the already calculated one
+        # using += operator
+        
+        # Before any write I need to search for references to the blocks
+        # then I do AMOUNT_IN_BLOCKS search and these search are random read 
+        # and are required by both system COUNTER and NOCOUNT
+        # COMMON[rnd_rd]+=AMOUNT_IN_BLOCKS
+        
+        # the VARIABLE_PART requires to create the reference and is the same cost for both
+        # COMMON[rnd_wr]+=VARIABLE_PART*AMOUNT_IN_BLOCKS
+        
+        # the PERSISTENT_PART is different, 
+        # the update of the refcounter is required only for COUNTER
+        # COUNTER[rnd_wr]+=PERSISTENT_PART * AMOUNT_IN_BLOCKS
+        
+        # Now I'm interested in the cost of the delete. 
+        # The COUNTER system must decrement the counter and for a VARIABLE_PART
+        # it will also have to discard the reference in the index. 
+        # I consider this is the same write() operation
+        # As usual and update requires also a read()
+        # COUNTER[rnd_rd]+=AMOUNT_IN_BLOCKS
+        # COUNTER[rnd_wr]+=AMOUNT_IN_BLOCKS
+        
+        # In a NOCOUNT system, deletes don't generate any changes 
+        # to the Index until the reclaim procedure.
+        # The cost for a reclaim is to read sequentially all references from FILES
+        # and mark them in a bitarray.
+        # Then sequentially scan the Index and check for any obsolete blocks and discard them.
+        # The number of references stored on the system is:
+        
+        # total_refs=THRESHOLD_CAPACITY_IN_PERCENT*N*DEDUP_RATIO
+        
+        # these are sequential reads and a single read reads multiple references 
+        # in the cache. the number of ref in one page is PAGE_SIZE/REF_SIZE
+        # then I divide the number of operations by this factor.
+        
+        # NOCOUNTER[seq_rd]+=total_refs/(PAGE_SIZE/REF_SIZE)
+        
+        # Then I must update cleanup all uneeded entry in the index
+        # One part (VARIABLE_PART) of these references must be discarded, 
+        # But this time the writes are not true sequential but sparse (some blocks are skipped)
+        # I cannot use the same short cut than above, then I suppose that ALL references 
+        # in the Index are updated and reuse the same factor as above.
+        # NOCOUNTER[seq_wr]+=1.3*N/(PAGE_SIZE/REF_SIZE)
+        
+        # Resume of what we have to compare
+        
+        #COMMON[rnd_rd]=AMOUNT_IN_BLOCKS
+        #COMMON[rnd_wr]=VARIABLE_PART*AMOUNT_IN_BLOCKS
+        
+        #COUNTER[rnd_rd]=AMOUNT_IN_BLOCKS
+        #COUNTER[rnd_wr]=(1+PERSISTENT_PART)*AMOUNT_IN_BLOCKS
+        
+        #NOCOUNTER[seq_rd]=THRESHOLD_CAPACITY_IN_PERCENT*N*DEDUP_RATIO/(PAGE_SIZE/REF_SIZE)
+        #NOCOUNTER[seq_wr]=1.3*N/(PAGE_SIZE/REF_SIZE)
+        
+        # Here are some interesting values that I would like to compare:
+        # I combine read and write operation
+        
+        #common_rnd=COMMON[rnd_rd]+COMMON[rnd_wr]
+        #common_rnd=(1+VARIABLE_PART)*AMOUNT_IN_BLOCKS
+        #common_rnd=(1+1.0/DEDUP_RATIO)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*DEDUP_RATIO*N
+        #common_rnd=(DEDUP_RATIO+1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*N
+        
+        #counter_rnd=COUNTER[rnd_rd]+COUNTER[rnd_wr]
+        #counter_rnd=AMOUNT_IN_BLOCKS+(1+PERSISTENT_PART)*AMOUNT_IN_BLOCKS
+        #counter_rnd=(2+PERSISTENT_PART)*AMOUNT_IN_BLOCKS
+        #counter_rnd=(2+1-1/DEDUP_RATIO)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*DEDUP_RATIO*N
+        #counter_rnd=(3*DEDUP_RATIO-1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*N
+        
+        #nocounter_seq=NOCOUNTER[seq_rd]+NOCOUNTER[seq_wr]
+        #nocounter_seq=THRESHOLD_CAPACITY_IN_PERCENT*N*DEDUP_RATIO/(PAGE_SIZE/REF_SIZE)+1.3*N/(PAGE_SIZE/REF_SIZE)
+        #nocounter_seq=(THRESHOLD_CAPACITY_IN_PERCENT*DEDUP_RATIO+1.3)*N/(PAGE_SIZE/REF_SIZE)
+        
+        
+        # Here are the 3 values again
+        # On the first graph, we see how the value change for different values of dedup ratio. 
+        # On the second graph, this is the THRESHOLD CAPACITY that vary
+        
+        #common_rnd=(DEDUP_RATIO+1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*N
+        #counter_rnd=(3*DEDUP_RATIO-1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)*N
+        #nocounter_seq=(THRESHOLD_CAPACITY_IN_PERCENT*DEDUP_RATIO+1.3)*N/(PAGE_SIZE/REF_SIZE)
+        
+        
+        common_r(DEDUP_RATIO)=(DEDUP_RATIO+1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)
+        counter_r(DEDUP_RATIO)=(3*DEDUP_RATIO-1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)
+        nocount_s(DEDUP_RATIO)=(THRESHOLD_CAPACITY_IN_PERCENT*DEDUP_RATIO+1.3)/(PAGE_SIZE/REF_SIZE)
+        
+        # Here is a discret value for a specific dedup ratio
+        DEDUP_RATIO=6.0
+        print sprintf("DEDUP_RATIO=%.1f COMMON=%.2f COUNTER=%.2f NOCOUNT=%.2f RATIO=%.2f TOTAL_RATIO=%.2f", DEDUP_RATIO, common_r(DEDUP_RATIO), counter_r(DEDUP_RATIO), nocount_s(DEDUP_RATIO), counter_r(DEDUP_RATIO)/nocount_s(DEDUP_RATIO), (counter_r(DEDUP_RATIO)+common_r(DEDUP_RATIO))/(nocount_s(DEDUP_RATIO)+common_r(DEDUP_RATIO)))
+        
+        # Now the graphs, first I make the Ratio vary
+        set title "Cost vs dedup_ratio"
+        set xlabel "dedup_ratio"
+        set format y "%g N"
+        set ytics nomirror
+        set y2tics
+        set key left
+        
+        plot [ 1.5:20 ] common_r(x), nocount_s(x), counter_r(x), counter_r(x)/nocount_s(x) title "counter/nocounter" axes x1y2, (common_r(x)+counter_r(x))/(common_r(x)+nocount_s(x)) title "total ratio" axes x1y2
+        pause -1  "Hit return to continue"
+        
+        # Second graph, I make the interval between reclaim vary
+        
+        common_r(THRESHOLD_CAPACITY_IN_PERCENT)=(DEDUP_RATIO+1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)
+        counter_r(THRESHOLD_CAPACITY_IN_PERCENT)=(3*DEDUP_RATIO-1)*(THRESHOLD_CAPACITY_IN_PERCENT-BASE_CAPACITY_IN_PERCENT)
+        nocount_s(THRESHOLD_CAPACITY_IN_PERCENT)=(THRESHOLD_CAPACITY_IN_PERCENT*DEDUP_RATIO+1.3)/(PAGE_SIZE/REF_SIZE)
+        
+        set title "variable = THRESHOLD CAPACITY"
+        set xlabel "threshold capacity"
+        plot [ BASE_CAPACITY_IN_PERCENT:1.0 ] common_r(x), nocount_s(x), counter_r(x), counter_r(x)/nocount_s(x) title "counter/nocounter" axes x1y2, (common_r(x)+counter_r(x))/(common_r(x)+nocount_s(x)) title "total ratio" axes x1y2
+        pause -1  "Hit return to continue"
+        
+        # Now I calculate the time of the reclaim procedure 
+        # The first graph is for a corporate configuration with fast disk and big storage
+        
+        index_size(N)=N*1.3*(HASH_SIZE+ADDR_SIZE)
+        references_size(N)=N*DEDUP_RATIO*REF_SIZE
+        rd_spd=600*1024**2
+        wr_spd=300*1024**2
+        reference_time(N)=references_size(N)/rd_spd
+        index_time(N)=index_size(N)/rd_spd+index_size(N)/wr_spd
+        reclaim_time(N)=reference_time(N)+index_time(N)
+        
+        set ydata time
+        set format y "%HH%M"
+        set logscale x
+        set logscale y
+        set xtics ("1TB" 16E+6, "10TB" 16E+7, "100TB" 16E+8, "1PB" 16E+9)
+        set ytics (reclaim_time(16E+6), reclaim_time(16E+7), reclaim_time(16E+8), reclaim_time(16E+9))
+        unset y2tics
+        set title "Corporate: Reclaim time (600 and 300MB/s)"
+        set xlabel "Capacity"
+        plot [ 16E+6:16E+9 ] reclaim_time(x), reference_time(x)
+        print "Corporate: Reclaim time for 1PB=", reclaim_time(16E+9)
+        pause -1  "Hit return to continue"
+        
+        # The second graph is for a small business configuration with slower disk and smaller storage
+        
+        rd_spd=100*1024**2
+        wr_spd=100*1024**2
+        
+        set xtics ("256GB" 4E+6, "512GB" 8E+6, "1TB" 16E+6, "2TB" 32E+6, "4TB" 64E+6, "8TB" 128E+6, "16TB" 256E+6)
+        set ytics (reclaim_time(4E+6), reclaim_time(8E+6), reclaim_time(16E+6), reclaim_time(32E+6), reclaim_time(64E+6), reclaim_time(128E+6), reclaim_time(256E+6))
+        set format y "%M:%Ss"
+        set title "Small business: Reclaim time (100MB/s)"
+        set xlabel "Capacity"
+        plot [ 4E+6:128E+6 ] reclaim_time(x), reference_time(x)
+        print "Small business: Reclaim time for 4TB=", reclaim_time(64E+6)
+        pause -1  "Hit return to continue"
